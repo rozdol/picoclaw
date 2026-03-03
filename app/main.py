@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from app.config import SETTINGS, configure_logging
+from app.db import approve_job, create_job, get_default_agent, init_db, list_recent_jobs, set_default_agent
+from app.router import available_agents, is_valid_agent, run_agent
+from app.security import is_user_allowed
+
+logger = logging.getLogger(__name__)
+
+
+def _is_authorized(update: Update) -> bool:
+    user = update.effective_user
+    return is_user_allowed(user.id if user else None)
+
+
+async def _deny(update: Update) -> None:
+    if update.message:
+        await update.message.reply_text("Access denied.")
+
+
+async def _reply_safe(update: Update, text: str) -> None:
+    if not update.message:
+        return
+    if len(text) > SETTINGS.max_telegram_message_length:
+        text = text[: SETTINGS.max_telegram_message_length - 24] + "\n\n[truncated by PicoClaw]"
+    await update.message.reply_text(text)
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+
+    help_text = (
+        "PicoClaw commands:\n"
+        "/start - show this help\n"
+        "/whoami - show Telegram IDs and auth state\n"
+        "/agents - list available agents\n"
+        "/use <agent> - set default agent for this chat\n"
+        "/ask <text> - run synchronous agent request\n"
+        "/task <text> - enqueue async job\n"
+        "/jobs - list recent jobs\n"
+        "/approve <job_id> - approve waiting ops job"
+    )
+    await _reply_safe(update, help_text)
+
+
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = user.id if user else None
+    chat_id = chat.id if chat else None
+    authorized = is_user_allowed(user_id)
+
+    await _reply_safe(
+        update,
+        f"user_id: {user_id}\nchat_id: {chat_id}\nauthorized: {'yes' if authorized else 'no'}",
+    )
+
+
+async def agents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+
+    agent_list = "\n".join(f"- {name}" for name in available_agents())
+    await _reply_safe(update, f"Available agents:\n{agent_list}")
+
+
+async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat or not update.message:
+        return
+
+    if not context.args:
+        await _reply_safe(update, "Usage: /use <agent>")
+        return
+
+    agent_name = context.args[0].strip().lower()
+    if not is_valid_agent(agent_name):
+        await _reply_safe(update, "Unknown agent. Use /agents to list options.")
+        return
+
+    set_default_agent(update.effective_chat.id, agent_name)
+    await _reply_safe(update, f"Default agent set to: {agent_name}")
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat:
+        return
+
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await _reply_safe(update, "Usage: /ask <text>")
+        return
+
+    agent_name = get_default_agent(update.effective_chat.id)
+    await _reply_safe(update, f"Running `{agent_name}` synchronously...")
+
+    try:
+        result = await run_agent(agent_name, prompt)
+    except Exception as exc:
+        logger.exception("Synchronous ask failed")
+        await _reply_safe(update, f"Request failed: {exc}")
+        return
+
+    await _reply_safe(update, result)
+
+
+async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        return
+
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await _reply_safe(update, "Usage: /task <text>")
+        return
+
+    agent_name = get_default_agent(chat.id)
+    job_id = create_job(chat_id=chat.id, user_id=user.id, agent=agent_name, prompt=prompt)
+    await _reply_safe(update, f"Job queued: {job_id} (agent: {agent_name})")
+
+
+async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat:
+        return
+
+    rows = list_recent_jobs(chat_id=update.effective_chat.id, limit=10)
+    if not rows:
+        await _reply_safe(update, "No jobs yet.")
+        return
+
+    lines: list[str] = []
+    for row in rows:
+        suffix = ""
+        if row["status"] == "error" and row["error"]:
+            suffix = f" error={str(row['error'])[:70]}"
+        elif row["status"] == "done" and row["result"]:
+            suffix = f" result={str(row['result'])[:70]}"
+        elif row["status"] == "needs_approval":
+            suffix = " waiting_for_approval=yes"
+
+        lines.append(f"#{row['id']} {row['agent']} {row['status']}{suffix}")
+
+    await _reply_safe(update, "Recent jobs:\n" + "\n".join(lines))
+
+
+async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    if not context.args:
+        await _reply_safe(update, "Usage: /approve <job_id>")
+        return
+
+    try:
+        job_id = int(context.args[0])
+    except ValueError:
+        await _reply_safe(update, "job_id must be an integer")
+        return
+
+    ok = approve_job(job_id=job_id, approved_by=user.id)
+    if ok:
+        await _reply_safe(update, f"Job {job_id} approved and re-queued.")
+    else:
+        await _reply_safe(update, f"Job {job_id} is not awaiting approval.")
+
+
+def _build_application() -> Application:
+    if not SETTINGS.telegram_bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+
+    app = Application.builder().token(SETTINGS.telegram_bot_token).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("whoami", whoami_command))
+    app.add_handler(CommandHandler("agents", agents_command))
+    app.add_handler(CommandHandler("use", use_command))
+    app.add_handler(CommandHandler("ask", ask_command))
+    app.add_handler(CommandHandler("task", task_command))
+    app.add_handler(CommandHandler("jobs", jobs_command))
+    app.add_handler(CommandHandler("approve", approve_command))
+    return app
+
+
+def main() -> None:
+    configure_logging()
+    init_db()
+
+    logger.info("Starting PicoClaw bot")
+    app = _build_application()
+    # Python 3.14 requires an explicitly set loop in the main thread.
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

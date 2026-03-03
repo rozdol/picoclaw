@@ -1,0 +1,6 @@
+python-telegram-bot>=21.6,<22
+httpx>=0.27.2,<1
+python-dotenv>=1.0.1,<2
+dotenv
+openai
+openrouter

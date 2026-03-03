@@ -1,0 +1,17 @@
+[Unit]
+Description=PicoClaw Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/picoclaw
+EnvironmentFile=/opt/picoclaw/.env
+ExecStart=/opt/picoclaw/venv/bin/python -m app.worker
+Restart=always
+RestartSec=3
+User=pi
+Group=pi
+
+[Install]
+WantedBy=multi-user.target
