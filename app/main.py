@@ -13,9 +13,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from app.config import SETTINGS, configure_logging
 from app.db import (
+    add_chat_memory,
     approve_job,
+    clear_chat_memory,
     create_job,
+    delete_chat_memory,
     get_default_agent,
+    list_chat_memory,
     get_enabled_skills_for_chat,
     init_db,
     list_recent_jobs,
@@ -31,6 +35,8 @@ from app.skills import build_skill_system_prompt
 logger = logging.getLogger(__name__)
 _BOT_LOCK_HANDLE: TextIO | None = None
 _BOT_LOCK_PATH = Path("/tmp/picoclaw-bot.lock")
+_MAX_MEMORY_ITEM_LENGTH = 500
+_MEMORY_PROMPT_ITEM_LIMIT = 20
 
 
 def _acquire_single_instance_lock() -> None:
@@ -88,7 +94,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/skills - list available skills for this chat\n"
         "/skill_add <name> | <instructions> - create or update and enable skill\n"
         "/skill_enable <name> - enable skill for this chat\n"
-        "/skill_disable <name> - disable skill for this chat"
+        "/skill_disable <name> - disable skill for this chat\n"
+        "MEMORY <text> - save a persistent chat memory\n"
+        "MEMORY LIST - show memories\n"
+        "MEMORY DELETE <id> - delete one memory\n"
+        "MEMORY CLEAR - delete all chat memories"
     )
     await _reply_safe(update, help_text)
 
@@ -140,6 +150,134 @@ def _load_skill_context(chat_id: int) -> tuple[str, int]:
     return build_skill_system_prompt(skills), len(skills)
 
 
+def _load_memory_context(chat_id: int) -> tuple[str, int]:
+    rows = list_chat_memory(chat_id, limit=_MEMORY_PROMPT_ITEM_LIMIT)
+    if not rows:
+        return "", 0
+
+    lines = [
+        "Persistent chat memory:",
+        "Use these as long-term user/chat facts unless corrected by newer user input.",
+    ]
+    for row in reversed(rows):
+        lines.append(f"- {str(row['content'])}")
+    return "\n".join(lines), len(rows)
+
+
+def _load_chat_context(chat_id: int) -> tuple[str, int, int]:
+    skill_context, skill_count = _load_skill_context(chat_id)
+    memory_context, memory_count = _load_memory_context(chat_id)
+
+    parts = [part for part in (skill_context, memory_context) if part.strip()]
+    if not parts:
+        return "", 0, 0
+    return "\n\n".join(parts), skill_count, memory_count
+
+
+def _parse_memory_command(text: str) -> tuple[str, str] | None:
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if not stripped.upper().startswith("MEMORY"):
+        return None
+    if len(stripped) > 6 and stripped[6] not in {" ", ":"}:
+        return None
+
+    rest = stripped[6:].strip()
+    if rest.startswith(":"):
+        rest = rest[1:].strip()
+
+    if not rest:
+        return ("help", "")
+
+    upper_rest = rest.upper()
+    if upper_rest in {"LIST", "SHOW"}:
+        return ("list", "")
+    if upper_rest == "CLEAR":
+        return ("clear", "")
+    if upper_rest.startswith("DELETE "):
+        return ("delete", rest.split(maxsplit=1)[1].strip())
+    if upper_rest.startswith("DEL "):
+        return ("delete", rest.split(maxsplit=1)[1].strip())
+    if upper_rest.startswith("ADD "):
+        return ("add", rest[4:].strip())
+    return ("add", rest)
+
+
+async def _handle_memory_command(update: Update, prompt: str) -> bool:
+    parsed = _parse_memory_command(prompt)
+    if parsed is None:
+        return False
+
+    if not _is_authorized(update):
+        await _deny(update)
+        return True
+    if not update.effective_chat:
+        return True
+
+    action, value = parsed
+    chat_id = update.effective_chat.id
+
+    if action == "help":
+        await _reply_safe(
+            update,
+            "Memory usage:\n"
+            "MEMORY <text>\n"
+            "MEMORY LIST\n"
+            "MEMORY DELETE <id>\n"
+            "MEMORY CLEAR",
+        )
+        return True
+
+    if action == "list":
+        rows = list_chat_memory(chat_id, limit=50)
+        if not rows:
+            await _reply_safe(update, "No chat memory saved yet.")
+            return True
+
+        lines = ["Chat memory:"]
+        for row in reversed(rows):
+            lines.append(f"- {row['id']}: {row['content']}")
+        await _reply_safe(update, "\n".join(lines))
+        return True
+
+    if action == "clear":
+        deleted_count = clear_chat_memory(chat_id)
+        await _reply_safe(update, f"Cleared {deleted_count} memory item(s).")
+        return True
+
+    if action == "delete":
+        try:
+            memory_id = int(value)
+        except ValueError:
+            await _reply_safe(update, "Usage: MEMORY DELETE <id>")
+            return True
+
+        if delete_chat_memory(chat_id, memory_id):
+            await _reply_safe(update, f"Memory {memory_id} deleted.")
+        else:
+            await _reply_safe(update, f"Memory {memory_id} not found.")
+        return True
+
+    if action == "add":
+        content = value.strip()
+        if not content:
+            await _reply_safe(update, "Usage: MEMORY <text>")
+            return True
+
+        truncated = False
+        if len(content) > _MAX_MEMORY_ITEM_LENGTH:
+            content = content[:_MAX_MEMORY_ITEM_LENGTH]
+            truncated = True
+
+        memory_id = add_chat_memory(chat_id, content)
+        suffix = " (truncated)" if truncated else ""
+        await _reply_safe(update, f"Saved memory {memory_id}{suffix}.")
+        return True
+
+    return False
+
+
 async def _run_sync_prompt(update: Update, prompt: str) -> None:
     if not _is_authorized(update):
         await _deny(update)
@@ -152,12 +290,17 @@ async def _run_sync_prompt(update: Update, prompt: str) -> None:
 
     chat_id = update.effective_chat.id
     agent_name = get_default_agent(chat_id)
-    skill_context, skill_count = _load_skill_context(chat_id)
-    skill_suffix = f" with {skill_count} skill(s)" if skill_count else ""
-    await _reply_safe(update, f"Running `{agent_name}` synchronously{skill_suffix}...")
+    chat_context, skill_count, memory_count = _load_chat_context(chat_id)
+    suffix_parts = []
+    if skill_count:
+        suffix_parts.append(f"skills={skill_count}")
+    if memory_count:
+        suffix_parts.append(f"memory={memory_count}")
+    suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+    await _reply_safe(update, f"Running `{agent_name}` synchronously{suffix}...")
 
     try:
-        result = await run_agent(agent_name, prompt, extra_system=skill_context)
+        result = await run_agent(agent_name, prompt, extra_system=chat_context)
     except Exception as exc:
         logger.exception("Synchronous ask failed")
         await _reply_safe(update, f"Request failed: {exc}")
@@ -171,6 +314,8 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not prompt:
         await _reply_safe(update, "Usage: /ask <text>")
         return
+    if await _handle_memory_command(update, prompt):
+        return
     await _run_sync_prompt(update, prompt)
 
 
@@ -180,6 +325,9 @@ async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     prompt = (update.message.text or "").strip()
     if not prompt:
+        return
+
+    if await _handle_memory_command(update, prompt):
         return
 
     await _run_sync_prompt(update, prompt)
@@ -199,18 +347,25 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not prompt:
         await _reply_safe(update, "Usage: /task <text>")
         return
+    if await _handle_memory_command(update, prompt):
+        return
 
     agent_name = get_default_agent(chat.id)
-    skill_context, skill_count = _load_skill_context(chat.id)
+    chat_context, skill_count, memory_count = _load_chat_context(chat.id)
     job_id = create_job(
         chat_id=chat.id,
         user_id=user.id,
         agent=agent_name,
         prompt=prompt,
-        skill_context=skill_context,
+        skill_context=chat_context,
     )
-    skill_suffix = f", skills={skill_count}" if skill_count else ""
-    await _reply_safe(update, f"Job queued: {job_id} (agent: {agent_name}{skill_suffix})")
+    suffix_parts = []
+    if skill_count:
+        suffix_parts.append(f"skills={skill_count}")
+    if memory_count:
+        suffix_parts.append(f"memory={memory_count}")
+    suffix = f", {', '.join(suffix_parts)}" if suffix_parts else ""
+    await _reply_safe(update, f"Job queued: {job_id} (agent: {agent_name}{suffix})")
 
 
 def _parse_skill_add_args(raw_args: list[str]) -> tuple[str, str] | None:

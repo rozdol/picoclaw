@@ -11,6 +11,7 @@ It runs as two processes:
 - Multi-agent routing (`researcher`, `coder`, `ops`)
 - Synchronous (`/ask`) and async queued jobs (`/task`)
 - SQLite-backed skills with per-chat enable/disable
+- SQLite-backed persistent chat memory (`MEMORY ...`)
 - SQLite persistence with WAL mode
 - User allowlist security (`ALLOWED_USER_IDS`)
 - OpenAI-compatible LLM support (`openai` or `openrouter`)
@@ -118,6 +119,10 @@ python3 -m app.worker
 - `/skill_add <name> | <instructions>` create or update skill and enable it for chat
 - `/skill_enable <name>` enable skill for chat
 - `/skill_disable <name>` disable skill for chat
+- `MEMORY <text>` save memory for this chat
+- `MEMORY LIST` list saved memories
+- `MEMORY DELETE <id>` delete one memory item
+- `MEMORY CLEAR` clear all memories for this chat
 
 ## Skills
 
@@ -126,6 +131,14 @@ Skills are reusable instruction snippets stored in SQLite.
 - They are global definitions (`/skill_add`), but enabled per chat.
 - Active chat skills are injected as additional system instructions for both `/ask` and `/task`.
 - Async jobs snapshot active skills at queue time to keep execution deterministic.
+
+## Memory
+
+Persistent memory stores short chat-specific facts/preferences in SQLite.
+
+- `MEMORY ...` commands are handled directly by the bot (no LLM call).
+- Saved memory is injected as additional system context for both synchronous and async runs.
+- Async jobs snapshot memory at queue time to keep behavior deterministic.
 
 ## Install systemd Services
 

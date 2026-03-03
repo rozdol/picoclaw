@@ -92,6 +92,18 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_skills_chat ON chat_skills(chat_id, is_enabled)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_memory_chat_id ON chat_memory(chat_id, id DESC)")
 
 
 def get_default_agent(chat_id: int) -> str:
@@ -355,3 +367,58 @@ def get_enabled_skills_for_chat(chat_id: int) -> list[dict[str, str]]:
         ).fetchall()
 
     return [{"name": str(row["name"]), "content": str(row["content"])} for row in rows]
+
+
+def add_chat_memory(chat_id: int, content: str) -> int:
+    cleaned = content.strip()
+    if not cleaned:
+        raise ValueError("Memory content cannot be empty")
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO chat_memory(chat_id, content, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            """,
+            (chat_id, cleaned),
+        )
+        return int(cur.lastrowid)
+
+
+def list_chat_memory(chat_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, content, created_at, updated_at
+            FROM chat_memory
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit),
+        ).fetchall()
+        return list(rows)
+
+
+def delete_chat_memory(chat_id: int, memory_id: int) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM chat_memory
+            WHERE chat_id = ? AND id = ?
+            """,
+            (chat_id, memory_id),
+        )
+        return cur.rowcount == 1
+
+
+def clear_chat_memory(chat_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM chat_memory
+            WHERE chat_id = ?
+            """,
+            (chat_id,),
+        )
+        return int(cur.rowcount)
