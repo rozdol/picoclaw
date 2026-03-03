@@ -36,6 +36,7 @@ def _acquire_single_instance_lock() -> None:
     lock_handle.write(f"{os.getpid()}\n")
     lock_handle.flush()
     _BOT_LOCK_HANDLE = lock_handle
+    logger.info("Single-instance lock acquired: path=%s pid=%s", _BOT_LOCK_PATH, os.getpid())
 
 
 def _is_authorized(update: Update) -> bool:
