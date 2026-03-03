@@ -9,7 +9,7 @@ from typing import TextIO
 
 from telegram import Update
 from telegram.error import Conflict
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import SETTINGS, configure_logging
 from app.db import approve_job, create_job, get_default_agent, init_db, list_recent_jobs, set_default_agent
@@ -69,6 +69,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/agents - list available agents\n"
         "/use <agent> - set default agent for this chat\n"
         "/ask <text> - run synchronous agent request\n"
+        "or send plain text to chat naturally with the selected agent\n"
         "/task <text> - enqueue async job\n"
         "/jobs - list recent jobs\n"
         "/approve <job_id> - approve waiting ops job"
@@ -118,16 +119,14 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _reply_safe(update, f"Default agent set to: {agent_name}")
 
 
-async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def _run_sync_prompt(update: Update, prompt: str) -> None:
     if not _is_authorized(update):
         await _deny(update)
         return
     if not update.effective_chat:
         return
 
-    prompt = " ".join(context.args).strip()
     if not prompt:
-        await _reply_safe(update, "Usage: /ask <text>")
         return
 
     agent_name = get_default_agent(update.effective_chat.id)
@@ -141,6 +140,25 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     await _reply_safe(update, result)
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await _reply_safe(update, "Usage: /ask <text>")
+        return
+    await _run_sync_prompt(update, prompt)
+
+
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+
+    prompt = (update.message.text or "").strip()
+    if not prompt:
+        return
+
+    await _run_sync_prompt(update, prompt)
 
 
 async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -238,6 +256,7 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     app.add_error_handler(_on_error)
     return app
 
