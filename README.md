@@ -80,6 +80,40 @@ sudo journalctl -u picoclaw.service -f
 sudo journalctl -u picoclaw-worker.service -f
 ```
 
+## Update on Raspberry Pi
+
+Check if updates are available (no changes applied):
+
+```bash
+cd /opt/picoclaw
+./update.sh --check
+```
+
+Apply updates (fast-forward git pull, dependencies, DB init, service restart):
+
+```bash
+cd /opt/picoclaw
+./update.sh --apply
+```
+
+Run without changing directory:
+
+```bash
+INSTALL_DIR=/opt/picoclaw /opt/picoclaw/update.sh --check
+INSTALL_DIR=/opt/picoclaw /opt/picoclaw/update.sh --apply
+```
+
+Remote execution via `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rozdol/picoclaw/refs/heads/main/update.sh | bash -s -- --check
+curl -fsSL https://raw.githubusercontent.com/rozdol/picoclaw/refs/heads/main/update.sh | bash -s -- --apply
+```
+
+Optional behavior:
+- `SKIP_RESTART=1` to skip service restarts on apply.
+- `REPO_BRANCH=<branch>` to force a specific branch.
+
 ## Setup (Existing Checkout)
 
 1. Create and activate virtual environment:
