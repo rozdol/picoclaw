@@ -29,7 +29,13 @@ It runs as two processes:
 
 ## Install on Raspberry Pi from GitHub
 
-Run on the Pi (Raspberry Pi OS, Python 3.11+):
+One-shot installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rozdol/picoclaw/refs/heads/main/install.sh | bash
+```
+
+Run manually on the Pi (Raspberry Pi OS, Python 3.11+):
 
 ```bash
 sudo apt update
