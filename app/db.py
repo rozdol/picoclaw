@@ -25,6 +25,7 @@ def get_connection() -> sqlite3.Connection:
     _ensure_db_parent_dir()
     conn = sqlite3.connect(SETTINGS.db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     return conn
@@ -49,6 +50,7 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL,
                 agent TEXT NOT NULL,
                 prompt TEXT NOT NULL,
+                skill_context TEXT,
                 status TEXT NOT NULL,
                 result TEXT,
                 error TEXT,
@@ -61,8 +63,35 @@ def init_db() -> None:
             )
             """
         )
+        job_columns = {str(row["name"]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "skill_context" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN skill_context TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_chat_id ON jobs(chat_id, id DESC)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS skills (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_skills (
+                chat_id INTEGER NOT NULL,
+                skill_id INTEGER NOT NULL,
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, skill_id),
+                FOREIGN KEY (skill_id) REFERENCES skills(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_chat_skills_chat ON chat_skills(chat_id, is_enabled)")
 
 
 def get_default_agent(chat_id: int) -> str:
@@ -84,14 +113,14 @@ def set_default_agent(chat_id: int, agent: str) -> None:
         )
 
 
-def create_job(chat_id: int, user_id: int, agent: str, prompt: str) -> int:
+def create_job(chat_id: int, user_id: int, agent: str, prompt: str, skill_context: str = "") -> int:
     with get_connection() as conn:
         cur = conn.execute(
             """
-            INSERT INTO jobs(chat_id, user_id, agent, prompt, status)
-            VALUES (?, ?, ?, ?, 'queued')
+            INSERT INTO jobs(chat_id, user_id, agent, prompt, skill_context, status)
+            VALUES (?, ?, ?, ?, ?, 'queued')
             """,
-            (chat_id, user_id, agent, prompt),
+            (chat_id, user_id, agent, prompt, skill_context.strip()),
         )
         return int(cur.lastrowid)
 
@@ -145,7 +174,7 @@ def claim_oldest_queued_job() -> dict[str, Any] | None:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             """
-            SELECT id, chat_id, user_id, agent, prompt, status, is_approved
+            SELECT id, chat_id, user_id, agent, prompt, skill_context, status, is_approved
             FROM jobs
             WHERE status = 'queued'
             ORDER BY id ASC
@@ -177,6 +206,7 @@ def claim_oldest_queued_job() -> dict[str, Any] | None:
             "user_id": int(row["user_id"]),
             "agent": str(row["agent"]),
             "prompt": str(row["prompt"]),
+            "skill_context": str(row["skill_context"] or ""),
             "is_approved": bool(row["is_approved"]),
         }
 
@@ -232,3 +262,96 @@ def get_db_journal_mode() -> str:
         if row is None:
             return "unknown"
         return str(row[0])
+
+
+def _normalize_skill_name(name: str) -> str:
+    return name.strip().lower()
+
+
+def upsert_skill(name: str, content: str) -> tuple[int, bool]:
+    normalized_name = _normalize_skill_name(name)
+    cleaned_content = content.strip()
+    if not normalized_name:
+        raise ValueError("Skill name cannot be empty")
+    if not cleaned_content:
+        raise ValueError("Skill content cannot be empty")
+
+    with get_connection() as conn:
+        existing = conn.execute("SELECT id FROM skills WHERE name = ?", (normalized_name,)).fetchone()
+        if existing:
+            skill_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE skills
+                SET content = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (cleaned_content, skill_id),
+            )
+            return skill_id, False
+
+        cur = conn.execute(
+            """
+            INSERT INTO skills(name, content)
+            VALUES (?, ?)
+            """,
+            (normalized_name, cleaned_content),
+        )
+        return int(cur.lastrowid), True
+
+
+def set_chat_skill_enabled(chat_id: int, skill_name: str, enabled: bool) -> bool:
+    normalized_name = _normalize_skill_name(skill_name)
+    if not normalized_name:
+        return False
+
+    with get_connection() as conn:
+        row = conn.execute("SELECT id FROM skills WHERE name = ?", (normalized_name,)).fetchone()
+        if row is None:
+            return False
+
+        skill_id = int(row["id"])
+        conn.execute(
+            """
+            INSERT INTO chat_skills(chat_id, skill_id, is_enabled, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id, skill_id)
+            DO UPDATE SET is_enabled = excluded.is_enabled, updated_at = CURRENT_TIMESTAMP
+            """,
+            (chat_id, skill_id, 1 if enabled else 0),
+        )
+        return True
+
+
+def list_skills_with_chat_state(chat_id: int) -> list[sqlite3.Row]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.name, s.updated_at, COALESCE(cs.is_enabled, 0) AS is_enabled
+            FROM skills s
+            LEFT JOIN chat_skills cs
+              ON cs.skill_id = s.id
+             AND cs.chat_id = ?
+            ORDER BY s.name ASC
+            """,
+            (chat_id,),
+        ).fetchall()
+        return list(rows)
+
+
+def get_enabled_skills_for_chat(chat_id: int) -> list[dict[str, str]]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.name, s.content
+            FROM skills s
+            INNER JOIN chat_skills cs
+              ON cs.skill_id = s.id
+            WHERE cs.chat_id = ?
+              AND cs.is_enabled = 1
+            ORDER BY s.name ASC
+            """,
+            (chat_id,),
+        ).fetchall()
+
+    return [{"name": str(row["name"]), "content": str(row["content"])} for row in rows]

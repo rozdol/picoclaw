@@ -10,6 +10,7 @@ It runs as two processes:
 
 - Multi-agent routing (`researcher`, `coder`, `ops`)
 - Synchronous (`/ask`) and async queued jobs (`/task`)
+- SQLite-backed skills with per-chat enable/disable
 - SQLite persistence with WAL mode
 - User allowlist security (`ALLOWED_USER_IDS`)
 - OpenAI-compatible LLM support (`openai` or `openrouter`)
@@ -113,6 +114,18 @@ python3 -m app.worker
 - `/task <text>` enqueue async job
 - `/jobs` list recent jobs
 - `/approve <job_id>` approve an ops job waiting for approval
+- `/skills` list skills and chat state
+- `/skill_add <name> | <instructions>` create or update skill and enable it for chat
+- `/skill_enable <name>` enable skill for chat
+- `/skill_disable <name>` disable skill for chat
+
+## Skills
+
+Skills are reusable instruction snippets stored in SQLite.
+
+- They are global definitions (`/skill_add`), but enabled per chat.
+- Active chat skills are injected as additional system instructions for both `/ask` and `/task`.
+- Async jobs snapshot active skills at queue time to keep execution deterministic.
 
 ## Install systemd Services
 

@@ -12,9 +12,21 @@ from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app.config import SETTINGS, configure_logging
-from app.db import approve_job, create_job, get_default_agent, init_db, list_recent_jobs, set_default_agent
+from app.db import (
+    approve_job,
+    create_job,
+    get_default_agent,
+    get_enabled_skills_for_chat,
+    init_db,
+    list_recent_jobs,
+    list_skills_with_chat_state,
+    set_chat_skill_enabled,
+    set_default_agent,
+    upsert_skill,
+)
 from app.router import available_agents, is_valid_agent, run_agent
 from app.security import is_user_allowed
+from app.skills import build_skill_system_prompt
 
 logger = logging.getLogger(__name__)
 _BOT_LOCK_HANDLE: TextIO | None = None
@@ -72,7 +84,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "or send plain text to chat naturally with the selected agent\n"
         "/task <text> - enqueue async job\n"
         "/jobs - list recent jobs\n"
-        "/approve <job_id> - approve waiting ops job"
+        "/approve <job_id> - approve waiting ops job\n"
+        "/skills - list available skills for this chat\n"
+        "/skill_add <name> | <instructions> - create or update and enable skill\n"
+        "/skill_enable <name> - enable skill for this chat\n"
+        "/skill_disable <name> - disable skill for this chat"
     )
     await _reply_safe(update, help_text)
 
@@ -119,6 +135,11 @@ async def use_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _reply_safe(update, f"Default agent set to: {agent_name}")
 
 
+def _load_skill_context(chat_id: int) -> tuple[str, int]:
+    skills = get_enabled_skills_for_chat(chat_id)
+    return build_skill_system_prompt(skills), len(skills)
+
+
 async def _run_sync_prompt(update: Update, prompt: str) -> None:
     if not _is_authorized(update):
         await _deny(update)
@@ -129,11 +150,14 @@ async def _run_sync_prompt(update: Update, prompt: str) -> None:
     if not prompt:
         return
 
-    agent_name = get_default_agent(update.effective_chat.id)
-    await _reply_safe(update, f"Running `{agent_name}` synchronously...")
+    chat_id = update.effective_chat.id
+    agent_name = get_default_agent(chat_id)
+    skill_context, skill_count = _load_skill_context(chat_id)
+    skill_suffix = f" with {skill_count} skill(s)" if skill_count else ""
+    await _reply_safe(update, f"Running `{agent_name}` synchronously{skill_suffix}...")
 
     try:
-        result = await run_agent(agent_name, prompt)
+        result = await run_agent(agent_name, prompt, extra_system=skill_context)
     except Exception as exc:
         logger.exception("Synchronous ask failed")
         await _reply_safe(update, f"Request failed: {exc}")
@@ -177,8 +201,114 @@ async def task_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     agent_name = get_default_agent(chat.id)
-    job_id = create_job(chat_id=chat.id, user_id=user.id, agent=agent_name, prompt=prompt)
-    await _reply_safe(update, f"Job queued: {job_id} (agent: {agent_name})")
+    skill_context, skill_count = _load_skill_context(chat.id)
+    job_id = create_job(
+        chat_id=chat.id,
+        user_id=user.id,
+        agent=agent_name,
+        prompt=prompt,
+        skill_context=skill_context,
+    )
+    skill_suffix = f", skills={skill_count}" if skill_count else ""
+    await _reply_safe(update, f"Job queued: {job_id} (agent: {agent_name}{skill_suffix})")
+
+
+def _parse_skill_add_args(raw_args: list[str]) -> tuple[str, str] | None:
+    raw = " ".join(raw_args).strip()
+    if "|" not in raw:
+        return None
+    name_part, content_part = raw.split("|", 1)
+    name = name_part.strip().lower()
+    content = content_part.strip()
+    if not name or not content:
+        return None
+    return name, content
+
+
+async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat:
+        return
+
+    rows = list_skills_with_chat_state(update.effective_chat.id)
+    if not rows:
+        await _reply_safe(update, "No skills defined. Use /skill_add <name> | <instructions>")
+        return
+
+    lines = []
+    for row in rows:
+        state = "enabled" if int(row["is_enabled"]) == 1 else "disabled"
+        lines.append(f"- {row['name']} ({state})")
+
+    await _reply_safe(update, "Skills:\n" + "\n".join(lines))
+
+
+async def skill_add_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat:
+        return
+
+    parsed = _parse_skill_add_args(context.args)
+    if parsed is None:
+        await _reply_safe(update, "Usage: /skill_add <name> | <instructions>")
+        return
+
+    name, content = parsed
+    try:
+        _, created = upsert_skill(name, content)
+    except ValueError as exc:
+        await _reply_safe(update, f"Invalid skill: {exc}")
+        return
+
+    set_chat_skill_enabled(update.effective_chat.id, name, enabled=True)
+    state = "created" if created else "updated"
+    await _reply_safe(update, f"Skill `{name}` {state} and enabled for this chat.")
+
+
+async def skill_enable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat:
+        return
+    if not context.args:
+        await _reply_safe(update, "Usage: /skill_enable <name>")
+        return
+
+    name = context.args[0].strip().lower()
+    if not name:
+        await _reply_safe(update, "Usage: /skill_enable <name>")
+        return
+
+    if not set_chat_skill_enabled(update.effective_chat.id, name, enabled=True):
+        await _reply_safe(update, f"Unknown skill: {name}. Use /skills to list available skills.")
+        return
+    await _reply_safe(update, f"Skill `{name}` enabled for this chat.")
+
+
+async def skill_disable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    if not update.effective_chat:
+        return
+    if not context.args:
+        await _reply_safe(update, "Usage: /skill_disable <name>")
+        return
+
+    name = context.args[0].strip().lower()
+    if not name:
+        await _reply_safe(update, "Usage: /skill_disable <name>")
+        return
+
+    if not set_chat_skill_enabled(update.effective_chat.id, name, enabled=False):
+        await _reply_safe(update, f"Unknown skill: {name}. Use /skills to list available skills.")
+        return
+    await _reply_safe(update, f"Skill `{name}` disabled for this chat.")
 
 
 async def jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -256,6 +386,10 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("approve", approve_command))
+    app.add_handler(CommandHandler("skills", skills_command))
+    app.add_handler(CommandHandler("skill_add", skill_add_command))
+    app.add_handler(CommandHandler("skill_enable", skill_enable_command))
+    app.add_handler(CommandHandler("skill_disable", skill_disable_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
     app.add_error_handler(_on_error)
     return app

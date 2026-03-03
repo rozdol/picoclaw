@@ -18,6 +18,7 @@ async def _process_one_job() -> bool:
     job_id = int(job["id"])
     agent = str(job["agent"])
     prompt = str(job["prompt"])
+    skill_context = str(job.get("skill_context", ""))
     is_approved = bool(job["is_approved"])
 
     if SETTINGS.require_approval_for_ops and agent == "ops" and not is_approved:
@@ -26,7 +27,7 @@ async def _process_one_job() -> bool:
         return True
 
     try:
-        result = await run_agent(agent, prompt)
+        result = await run_agent(agent, prompt, extra_system=skill_context)
         mark_job_done(job_id, result)
         logger.info("Job %s completed", job_id)
     except Exception as exc:
