@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
+import os
+from pathlib import Path
+from typing import TextIO
 
 from telegram import Update
+from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.config import SETTINGS, configure_logging
@@ -12,6 +17,25 @@ from app.router import available_agents, is_valid_agent, run_agent
 from app.security import is_user_allowed
 
 logger = logging.getLogger(__name__)
+_BOT_LOCK_HANDLE: TextIO | None = None
+_BOT_LOCK_PATH = Path("/tmp/picoclaw-bot.lock")
+
+
+def _acquire_single_instance_lock() -> None:
+    global _BOT_LOCK_HANDLE
+
+    lock_handle = _BOT_LOCK_PATH.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        lock_handle.close()
+        raise RuntimeError(
+            "Another PicoClaw bot instance is already running on this host."
+        ) from exc
+
+    lock_handle.write(f"{os.getpid()}\n")
+    lock_handle.flush()
+    _BOT_LOCK_HANDLE = lock_handle
 
 
 def _is_authorized(update: Update) -> bool:
@@ -191,6 +215,15 @@ async def approve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await _reply_safe(update, f"Job {job_id} is not awaiting approval.")
 
 
+async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        logger.error(
+            "Telegram update polling conflict detected. Another bot instance with the same token is active."
+        )
+        return
+    logger.exception("Unhandled Telegram error", exc_info=context.error)
+
+
 def _build_application() -> Application:
     if not SETTINGS.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
@@ -204,12 +237,14 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("task", task_command))
     app.add_handler(CommandHandler("jobs", jobs_command))
     app.add_handler(CommandHandler("approve", approve_command))
+    app.add_error_handler(_on_error)
     return app
 
 
 def main() -> None:
     configure_logging()
     init_db()
+    _acquire_single_instance_lock()
 
     logger.info("Starting PicoClaw bot")
     app = _build_application()
