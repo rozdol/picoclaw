@@ -113,6 +113,7 @@ curl -fsSL https://raw.githubusercontent.com/rozdol/picoclaw/refs/heads/main/upd
 Optional behavior:
 - `SKIP_RESTART=1` to skip service restarts on apply.
 - `REPO_BRANCH=<branch>` to force a specific branch.
+- If local branch is ahead of `origin/<branch>`, update continues without `git pull` and applies dependency/DB/service steps to your local checkout.
 
 ## Setup (Existing Checkout)
 

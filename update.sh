@@ -94,6 +94,15 @@ git -C "${INSTALL_DIR}" fetch --depth 1 origin "${BRANCH}"
 
 LOCAL_SHA="$(git -C "${INSTALL_DIR}" rev-parse "${BRANCH}")"
 REMOTE_SHA="$(git -C "${INSTALL_DIR}" rev-parse "origin/${BRANCH}")"
+LOCAL_IS_ANCESTOR=0
+REMOTE_IS_ANCESTOR=0
+
+if git -C "${INSTALL_DIR}" merge-base --is-ancestor "${LOCAL_SHA}" "${REMOTE_SHA}"; then
+  LOCAL_IS_ANCESTOR=1
+fi
+if git -C "${INSTALL_DIR}" merge-base --is-ancestor "${REMOTE_SHA}" "${LOCAL_SHA}"; then
+  REMOTE_IS_ANCESTOR=1
+fi
 
 if [[ "${LOCAL_SHA}" == "${REMOTE_SHA}" ]]; then
   log "Already up to date (${BRANCH} @ ${LOCAL_SHA:0:7})."
@@ -101,18 +110,32 @@ if [[ "${LOCAL_SHA}" == "${REMOTE_SHA}" ]]; then
 fi
 
 if [[ "${ACTION}" == "check" ]]; then
-  log "Update available: ${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}"
-  git -C "${INSTALL_DIR}" log --oneline --no-decorate "${LOCAL_SHA}..${REMOTE_SHA}" | sed 's/^/[update]   /'
-  exit 0
+  if [[ "${LOCAL_IS_ANCESTOR}" == "1" && "${REMOTE_IS_ANCESTOR}" == "0" ]]; then
+    log "Update available: ${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}"
+    git -C "${INSTALL_DIR}" log --oneline --no-decorate "${LOCAL_SHA}..${REMOTE_SHA}" | sed 's/^/[update]   /'
+    exit 0
+  fi
+
+  if [[ "${LOCAL_IS_ANCESTOR}" == "0" && "${REMOTE_IS_ANCESTOR}" == "1" ]]; then
+    warn "Local branch is ahead of origin/${BRANCH}. No remote updates to apply."
+    git -C "${INSTALL_DIR}" log --oneline --no-decorate "${REMOTE_SHA}..${LOCAL_SHA}" | sed 's/^/[update]   local: /'
+    exit 0
+  fi
+
+  die "Local branch and origin/${BRANCH} diverged. Manual reconciliation required."
 fi
 
-if ! git -C "${INSTALL_DIR}" merge-base --is-ancestor "${LOCAL_SHA}" "${REMOTE_SHA}"; then
-  die "Local branch is ahead/diverged from origin/${BRANCH}. Manual reconciliation required."
+if [[ "${LOCAL_IS_ANCESTOR}" == "0" && "${REMOTE_IS_ANCESTOR}" == "0" ]]; then
+  die "Local branch and origin/${BRANCH} diverged. Manual reconciliation required."
 fi
 
-log "Applying update ${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}."
-git -C "${INSTALL_DIR}" checkout "${BRANCH}"
-git -C "${INSTALL_DIR}" pull --ff-only origin "${BRANCH}"
+if [[ "${LOCAL_IS_ANCESTOR}" == "1" && "${REMOTE_IS_ANCESTOR}" == "0" ]]; then
+  log "Applying update ${LOCAL_SHA:0:7} -> ${REMOTE_SHA:0:7}."
+  git -C "${INSTALL_DIR}" checkout "${BRANCH}"
+  git -C "${INSTALL_DIR}" pull --ff-only origin "${BRANCH}"
+else
+  warn "Local branch is ahead of origin/${BRANCH}. Skipping git pull and applying local checkout as-is."
+fi
 
 if [[ ! -x "${INSTALL_DIR}/venv/bin/python" ]]; then
   log "Virtualenv missing. Creating ${INSTALL_DIR}/venv."
