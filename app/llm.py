@@ -49,34 +49,44 @@ def _is_likely_text_completion_model(model: str) -> bool:
     )
 
 
-def _build_payload(endpoint_kind: str, model: str, system: str, user: str) -> dict:
+def _build_payload(
+    endpoint_kind: str, model: str, system: str, user: str, include_temperature: bool = True
+) -> dict:
     if endpoint_kind == "chat":
-        return {
+        payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "temperature": 0.2,
         }
+        if include_temperature:
+            payload["temperature"] = 0.2
+        return payload
 
-    return {
+    payload = {
         "model": model,
         "prompt": f"System:\n{system}\n\nUser:\n{user}\n\nAssistant:\n",
-        "temperature": 0.2,
     }
+    if include_temperature:
+        payload["temperature"] = 0.2
+    return payload
 
 
-def _extract_error_text(response_text: str) -> str:
+def _extract_error_obj(response_text: str) -> dict | None:
     try:
         data = json.loads(response_text)
     except ValueError:
-        return response_text.lower()
+        return None
 
     if not isinstance(data, dict):
-        return response_text.lower()
-
+        return None
     error = data.get("error")
+    return error if isinstance(error, dict) else None
+
+
+def _extract_error_text(response_text: str) -> str:
+    error = _extract_error_obj(response_text)
     if isinstance(error, dict):
         message = error.get("message")
         if isinstance(message, str):
@@ -98,6 +108,29 @@ def _suggests_chat_endpoint(response_text: str) -> bool:
     return (
         "not supported in the v1/completions endpoint" in text
         or "did you mean to use v1/chat/completions" in text
+    )
+
+
+def _is_unsupported_temperature(response: httpx.Response) -> bool:
+    if response.status_code != 400:
+        return False
+
+    error = _extract_error_obj(response.text)
+    if not isinstance(error, dict):
+        return False
+
+    param = error.get("param")
+    if isinstance(param, str) and param.lower() == "temperature":
+        return True
+
+    code = error.get("code")
+    message = error.get("message")
+    message_lower = message.lower() if isinstance(message, str) else ""
+    return (
+        isinstance(code, str)
+        and code.lower() == "unsupported_value"
+        and "temperature" in message_lower
+        and "default (1)" in message_lower
     )
 
 
@@ -158,8 +191,11 @@ async def chat_completion(system: str, user: str) -> str:
             for index, endpoint_kind in enumerate(endpoint_order):
                 endpoint_used = endpoint_kind
                 path = "/chat/completions" if endpoint_kind == "chat" else "/completions"
-                payload = _build_payload(endpoint_kind, model, system, user)
+                payload = _build_payload(endpoint_kind, model, system, user, include_temperature=True)
                 response = await client.post(f"{base_url}{path}", json=payload, headers=headers)
+                if _is_unsupported_temperature(response):
+                    payload = _build_payload(endpoint_kind, model, system, user, include_temperature=False)
+                    response = await client.post(f"{base_url}{path}", json=payload, headers=headers)
                 if response.status_code == 200:
                     break
 
