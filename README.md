@@ -27,7 +27,54 @@ It runs as two processes:
 - `scripts/init_db.py` database bootstrap
 - `systemd/` unit files
 
-## Setup
+## Install on Raspberry Pi from GitHub
+
+Run on the Pi (Raspberry Pi OS, Python 3.11+):
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv
+sudo mkdir -p /opt/picoclaw
+sudo chown -R pi:pi /opt/picoclaw
+git clone https://github.com/rozdol/picoclaw.git /opt/picoclaw
+cd /opt/picoclaw
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+cp .env.example .env
+```
+
+Edit `.env` and fill required variables.
+
+Initialize SQLite:
+
+```bash
+source /opt/picoclaw/venv/bin/activate
+cd /opt/picoclaw
+python3 -m scripts.init_db
+```
+
+Install and start services:
+
+```bash
+cd /opt/picoclaw
+sudo cp systemd/picoclaw.service /etc/systemd/system/
+sudo cp systemd/picoclaw-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable picoclaw.service picoclaw-worker.service
+sudo systemctl start picoclaw.service picoclaw-worker.service
+```
+
+Check status and logs:
+
+```bash
+sudo systemctl status picoclaw.service picoclaw-worker.service
+sudo journalctl -u picoclaw.service -f
+sudo journalctl -u picoclaw-worker.service -f
+```
+
+## Setup (Existing Checkout)
 
 1. Create and activate virtual environment:
 
