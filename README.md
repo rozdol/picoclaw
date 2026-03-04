@@ -196,6 +196,7 @@ python3 -m app.worker
 ## Telegram Commands
 
 - `/start` show help
+- `/device` show device/OS/RAM/uptime/load info
 - `/whoami` show user/chat ID and auth state
 - `/agents` list agents
 - `/use <agent>` set default chat agent

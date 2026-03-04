@@ -4,6 +4,7 @@ import asyncio
 import fcntl
 import logging
 import os
+import platform
 from pathlib import Path
 from typing import TextIO
 
@@ -37,6 +38,135 @@ _BOT_LOCK_HANDLE: TextIO | None = None
 _BOT_LOCK_PATH = Path("/tmp/picoclaw-bot.lock")
 _MAX_MEMORY_ITEM_LENGTH = 500
 _MEMORY_PROMPT_ITEM_LIMIT = 20
+
+
+def _read_first_line(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.readline().strip()
+    except OSError:
+        return ""
+
+
+def _load_os_pretty_name() -> str:
+    try:
+        with open("/etc/os-release", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", maxsplit=1)[1].strip().strip('"')
+    except OSError:
+        return ""
+    return ""
+
+
+def _load_meminfo_kb() -> dict[str, int]:
+    info: dict[str, int] = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                key, _, value = raw_line.partition(":")
+                if not key or not value:
+                    continue
+                amount = value.strip().split()[0]
+                if amount.isdigit():
+                    info[key] = int(amount)
+    except OSError:
+        return {}
+    return info
+
+
+def _format_bytes(value: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{value} B"
+
+
+def _format_uptime(seconds: float) -> str:
+    total_seconds = int(seconds)
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _build_device_report() -> str:
+    os_name = _load_os_pretty_name() or platform.system()
+    kernel = platform.release() or "unknown"
+    hostname = platform.node() or "unknown"
+    machine = platform.machine() or "unknown"
+    model = _read_first_line("/proc/device-tree/model") or "unknown"
+    python_version = platform.python_version()
+    cpu_cores = os.cpu_count() or 0
+
+    meminfo = _load_meminfo_kb()
+    ram_total_kb = meminfo.get("MemTotal", 0)
+    ram_available_kb = meminfo.get("MemAvailable", 0)
+    ram_used_kb = max(ram_total_kb - ram_available_kb, 0)
+    ram_pct = (ram_used_kb / ram_total_kb * 100) if ram_total_kb else 0.0
+
+    swap_total_kb = meminfo.get("SwapTotal", 0)
+    swap_free_kb = meminfo.get("SwapFree", 0)
+    swap_used_kb = max(swap_total_kb - swap_free_kb, 0)
+
+    uptime_line = _read_first_line("/proc/uptime")
+    uptime_seconds = 0.0
+    if uptime_line:
+        try:
+            uptime_seconds = float(uptime_line.split()[0])
+        except (ValueError, IndexError):
+            uptime_seconds = 0.0
+
+    try:
+        load_1, load_5, load_15 = os.getloadavg()
+        load_text = f"{load_1:.2f}, {load_5:.2f}, {load_15:.2f}"
+    except OSError:
+        load_text = "n/a"
+
+    try:
+        fs = os.statvfs("/")
+        disk_total = fs.f_frsize * fs.f_blocks
+        disk_free = fs.f_frsize * fs.f_bavail
+        disk_used = max(disk_total - disk_free, 0)
+        disk_pct = (disk_used / disk_total * 100) if disk_total else 0.0
+        disk_text = (
+            f"{_format_bytes(disk_used)}/{_format_bytes(disk_total)} "
+            f"({disk_pct:.1f}% used)"
+        )
+    except OSError:
+        disk_text = "n/a"
+
+    lines = [
+        "Device info:",
+        f"host: {hostname}",
+        f"model: {model}",
+        f"os: {os_name}",
+        f"kernel: {kernel}",
+        f"arch: {machine}",
+        f"python: {python_version}",
+        f"cpu_cores: {cpu_cores}",
+        f"load_avg(1,5,15): {load_text}",
+        f"uptime: {_format_uptime(uptime_seconds)}",
+        (
+            "ram: "
+            f"{_format_bytes(ram_used_kb * 1024)}/{_format_bytes(ram_total_kb * 1024)} "
+            f"({ram_pct:.1f}% used)"
+        ),
+        f"swap: {_format_bytes(swap_used_kb * 1024)}/{_format_bytes(swap_total_kb * 1024)}",
+        f"disk(/): {disk_text}",
+    ]
+    return "\n".join(lines)
 
 
 def _acquire_single_instance_lock() -> None:
@@ -83,6 +213,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     help_text = (
         "PicoClaw commands:\n"
         "/start - show this help\n"
+        "/device - show host, OS, RAM, uptime and load info\n"
         "/whoami - show Telegram IDs and auth state\n"
         "/agents - list available agents\n"
         "/use <agent> - set default agent for this chat\n"
@@ -114,6 +245,13 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update,
         f"user_id: {user_id}\nchat_id: {chat_id}\nauthorized: {'yes' if authorized else 'no'}",
     )
+
+
+async def device_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _deny(update)
+        return
+    await _reply_safe(update, _build_device_report())
 
 
 async def agents_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -534,6 +672,7 @@ def _build_application() -> Application:
 
     app = Application.builder().token(SETTINGS.telegram_bot_token).build()
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("device", device_command))
     app.add_handler(CommandHandler("whoami", whoami_command))
     app.add_handler(CommandHandler("agents", agents_command))
     app.add_handler(CommandHandler("use", use_command))
