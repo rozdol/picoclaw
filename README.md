@@ -115,6 +115,27 @@ Optional behavior:
 - `REPO_BRANCH=<branch>` to force a specific branch.
 - If local branch is ahead of `origin/<branch>`, update continues without `git pull` and applies dependency/DB/service steps to your local checkout.
 
+## Uninstall on Raspberry Pi
+
+Remove services and the install directory:
+
+```bash
+cd /opt/picoclaw
+./uninstall.sh
+```
+
+Remote execution via `curl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rozdol/picoclaw/refs/heads/main/uninstall.sh | bash
+```
+
+Optional behavior:
+- `INSTALL_DIR=/opt/picoclaw` to target a different install path.
+- `REMOVE_INSTALL_DIR=0` to keep the checkout and only remove services.
+- `REMOVE_EXTERNAL_DB=1` to also remove `DB_PATH` when it points outside `INSTALL_DIR`.
+- `./uninstall.sh --dry-run` to preview actions.
+
 ## Setup (Existing Checkout)
 
 1. Create and activate virtual environment:
